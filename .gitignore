@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+*.qmlc
+*.jsc
+.DS_Store
+*.tmp

@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "krusty.signal",
+  "name": "Signal",
+  "version": "2.4.0",
+  "author": "krusty",
+  "license": "MIT",
+  "description": "Signal messenger for Omarchy: every conversation from Signal Desktop, replies from the bar, themed to the desktop.",
+  "kinds": ["service", "bar-widget", "panel"],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml",
+    "panel": "App.qml"
+  },
+  "barWidget": {
+    "displayName": "Signal",
+    "description": "Unread count in the bar. Click to open conversations and reply.",
+    "category": "Communication",
+    "aliases": ["signal", "messages", "chat", "sms", "messenger"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
