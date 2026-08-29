@@ -2,6 +2,8 @@
 
 A Signal client for the [Omarchy](https://omarchy.org/) bar. The window lists conversations already on this computer, shows photos and videos in the thread, and sends replies after you link Omarchy as a Signal device.
 
+![Plugin preview with sample conversations](preview.png)
+
 Plugins run unsandboxed inside `omarchy-shell`. Read this repository before enabling it.
 
 ## Requirements
