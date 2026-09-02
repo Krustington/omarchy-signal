@@ -45,6 +45,7 @@ CLI_ELF_SHA256 = "7dc5933215b6bedafab7ff0983466c0d0ae98bc20538f5186e7d1d600ccde6
 PY_PACKAGES = ("sqlcipher3-binary==0.6.0", "cryptography==50.0.1")
 QR_PATH = STATE / "link.png"
 SEEN_PATH = STATE / "seen.json"
+SETTINGS_PATH = STATE / "settings.json"
 MEDIA_DIR = STATE / "media"
 DESKTOP_DIR = HOME / ".config" / "Signal"
 DB_PATH = DESKTOP_DIR / "sql" / "db.sqlite"
@@ -575,6 +576,134 @@ def save_seen(data: dict) -> None:
     tmp = SEEN_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(data) + "\n", encoding="utf-8")
     tmp.replace(SEEN_PATH)
+
+
+def load_settings() -> dict:
+    defaults = {"keepDesktopBackground": True, "backgroundHintDismissed": False}
+    try:
+        raw = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return defaults
+    if not isinstance(raw, dict):
+        return defaults
+    if "keepDesktopBackground" in raw:
+        defaults["keepDesktopBackground"] = raw["keepDesktopBackground"] is True
+    if "backgroundHintDismissed" in raw:
+        defaults["backgroundHintDismissed"] = raw["backgroundHintDismissed"] is True
+    return defaults
+
+
+def save_settings(data: dict) -> dict:
+    current = load_settings()
+    if "keepDesktopBackground" in data:
+        current["keepDesktopBackground"] = data["keepDesktopBackground"] is True
+    if "backgroundHintDismissed" in data:
+        current["backgroundHintDismissed"] = data["backgroundHintDismissed"] is True
+    ensure_state_dirs()
+    tmp = SETTINGS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(current) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    tmp.replace(SETTINGS_PATH)
+    return current
+
+
+def which_desktop() -> str | None:
+    for path in (Path("/usr/bin/signal-desktop"), Path("/usr/lib/signal-desktop/signal-desktop")):
+        try:
+            if not path.is_file() or not os.access(path, os.X_OK):
+                continue
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if str(resolved).startswith("/usr/"):
+            return str(resolved)
+    return None
+
+
+def desktop_running() -> bool:
+    for pid_dir in Path("/proc").iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        try:
+            raw = (pid_dir / "cmdline").read_bytes().split(b"\x00")
+        except OSError:
+            continue
+        argv0 = raw[0].decode("utf-8", "replace") if raw else ""
+        if "signal-desktop" not in argv0:
+            continue
+        if b"--type=" in b" ".join(raw):
+            continue
+        return True
+    return False
+
+
+def _hide_desktop_window() -> None:
+    hypr = Path("/usr/bin/hyprctl")
+    if not hypr.is_file():
+        return
+    for match in ("class:^(signal)$", "class:^(Signal)$"):
+        try:
+            subprocess.run(
+                [str(hypr), "dispatch", "movetoworkspacesilent", f"special:signal,{match}"],
+                timeout=2,
+                capture_output=True,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def ensure_desktop() -> dict:
+    installed = which_desktop()
+    running = desktop_running()
+    if running:
+        return {"ok": True, "running": True, "started": False, "installed": bool(installed)}
+    if not installed:
+        return {"ok": False, "running": False, "started": False, "installed": False, "error": "Signal Desktop is not installed"}
+    subprocess.Popen(
+        [installed, "--start-in-tray", "--use-tray-icon"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    for _ in range(20):
+        if desktop_running():
+            _hide_desktop_window()
+            return {"ok": True, "running": True, "started": True, "installed": True}
+        time.sleep(0.25)
+    return {"ok": False, "running": False, "started": False, "installed": True, "error": "Signal Desktop did not start"}
+
+
+def show_desktop() -> dict:
+    hypr = Path("/usr/bin/hyprctl")
+    if desktop_running() and hypr.is_file():
+        for match in ("class:^(signal)$", "class:^(Signal)$"):
+            try:
+                subprocess.run(
+                    [str(hypr), "dispatch", "movetoworkspace", f"e+0,{match}"],
+                    timeout=2,
+                    capture_output=True,
+                    check=False,
+                )
+                subprocess.run(
+                    [str(hypr), "dispatch", "focuswindow", match],
+                    timeout=2,
+                    capture_output=True,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        return {"ok": True, "running": True}
+    installed = which_desktop()
+    if not installed:
+        return {"ok": False, "error": "Signal Desktop is not installed"}
+    subprocess.Popen(
+        [installed],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return {"ok": True, "started": True}
 
 
 def avatar_url(blob: dict) -> str:
@@ -1279,9 +1408,12 @@ class Engine:
     def status(self) -> dict:
         convos = list_conversations(self.db, "", 200)
         accounts = linked_accounts()
+        settings = load_settings()
         return {
             "ok": True,
             "desktop": DB_PATH.exists(),
+            "desktopInstalled": bool(which_desktop()),
+            "desktopRunning": desktop_running(),
             "cliInstalled": bool(which_cli()),
             "linked": bool(accounts),
             "accounts": accounts,
@@ -1289,6 +1421,8 @@ class Engine:
             "unreadCount": unread_total(convos),
             "conversationCount": len(convos),
             "canSend": bool(accounts),
+            "keepDesktopBackground": settings["keepDesktopBackground"],
+            "backgroundHintDismissed": settings["backgroundHintDismissed"],
             "themeName": theme_name(),
         }
 
@@ -1338,6 +1472,17 @@ class Engine:
                         fail(rid, str(exc))
 
                 threading.Thread(target=_run, daemon=True).start()
+            elif cmd == "getSettings":
+                emit({"id": req_id, "ok": True, "result": load_settings()})
+            elif cmd == "setSettings":
+                st = save_settings(req)
+                if st.get("keepDesktopBackground"):
+                    ensure_desktop()
+                emit({"id": req_id, "ok": True, "result": {**st, "desktopRunning": desktop_running()}})
+            elif cmd == "ensureDesktop":
+                emit({"id": req_id, "ok": True, "result": ensure_desktop()})
+            elif cmd == "showDesktop":
+                emit({"id": req_id, "ok": True, "result": show_desktop()})
             else:
                 fail(req_id, f"Unknown command: {cmd}")
         except Exception as exc:  # noqa: BLE001

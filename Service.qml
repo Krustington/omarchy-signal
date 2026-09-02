@@ -22,6 +22,10 @@ Item {
   property bool windowOpen: false
   property bool ready: false
   property bool desktop: false
+  property bool desktopInstalled: false
+  property bool desktopRunning: false
+  property bool keepDesktopBackground: true
+  property bool backgroundHintDismissed: false
   property bool cliInstalled: false
   property bool linked: false
   property bool canSend: false
@@ -100,6 +104,12 @@ Item {
   function applyStatus(st) {
     if (!st) return
     desktop = st.desktop === true
+    desktopInstalled = st.desktopInstalled === true
+    desktopRunning = st.desktopRunning === true
+    if (st.keepDesktopBackground !== undefined)
+      keepDesktopBackground = st.keepDesktopBackground === true
+    if (st.backgroundHintDismissed !== undefined)
+      backgroundHintDismissed = st.backgroundHintDismissed === true
     cliInstalled = st.cliInstalled === true
     var hasAccount = st.linked === true || (st.accounts && st.accounts.length > 0)
     if (hasAccount) {
@@ -115,6 +125,37 @@ Item {
     conversationCount = Number(st.conversationCount || 0)
     accounts = st.accounts || []
     if (linked && !daemon && !daemonStarting) startDaemon()
+    if (keepDesktopBackground && desktopInstalled && !desktopRunning) ensureDesktop()
+  }
+
+  function ensureDesktop() {
+    sendCmd("ensureDesktop", {}, function(obj) {
+      if (obj.ok && obj.result) {
+        desktopRunning = obj.result.running === true
+        desktopInstalled = obj.result.installed !== false
+      }
+    })
+  }
+
+  function setBackground(on) {
+    keepDesktopBackground = !!on
+    backgroundHintDismissed = true
+    sendCmd("setSettings", { keepDesktopBackground: keepDesktopBackground, backgroundHintDismissed: true }, function(obj) {
+      if (obj.ok && obj.result) {
+        keepDesktopBackground = obj.result.keepDesktopBackground === true
+        backgroundHintDismissed = obj.result.backgroundHintDismissed === true
+        desktopRunning = obj.result.desktopRunning === true
+      }
+    })
+  }
+
+  function dismissBackgroundHint() {
+    backgroundHintDismissed = true
+    sendCmd("setSettings", { backgroundHintDismissed: true }, function() {})
+  }
+
+  function showDesktop() {
+    sendCmd("showDesktop", {}, function() {})
   }
 
   function refresh() {
@@ -266,6 +307,13 @@ Item {
     running: true
     repeat: true
     onTriggered: if (!windowOpen) refreshConversations()
+  }
+
+  Timer {
+    interval: 20000
+    running: true
+    repeat: true
+    onTriggered: if (keepDesktopBackground && desktopInstalled && !desktopRunning) ensureDesktop()
   }
 
   Timer {

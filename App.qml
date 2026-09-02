@@ -163,6 +163,16 @@ Item {
               font.pixelSize: Style.font.caption
               font.bold: true
             }
+            Button {
+              visible: !!(service && service.desktopInstalled)
+              text: service && service.keepDesktopBackground ? "BG on" : "BG off"
+              tooltipText: service && service.keepDesktopBackground
+                ? "Signal Desktop stays hidden so this window is the messenger. Click to stop managing it."
+                : "Start Signal Desktop in the background so new messages arrive here."
+              foreground: root.foreground
+              accent: root.accent
+              onClicked: if (service) service.setBackground(!(service.keepDesktopBackground === true))
+            }
           }
 
           TextField {
@@ -398,7 +408,7 @@ Item {
 
           Item {
             width: parent.width
-            height: parent.height - Style.space(52) - composer.height - banner.height
+            height: parent.height - Style.space(52) - composer.height - banner.height - bgBanner.height
 
             Flickable {
               id: thread
@@ -550,6 +560,34 @@ Item {
                       thread.contentY = threadThumb.y / span * Math.max(0, thread.contentHeight - thread.height)
                   }
                 }
+              }
+            }
+          }
+
+          Rectangle {
+            id: bgBanner
+            width: parent.width
+            height: visible ? implicitHeight : 0
+            implicitHeight: Style.space(52)
+            visible: service && service.keepDesktopBackground && !service.backgroundHintDismissed
+            color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.12)
+            RowLayout {
+              anchors.fill: parent
+              anchors.leftMargin: Style.space(16)
+              anchors.rightMargin: Style.space(12)
+              Text {
+                Layout.fillWidth: true
+                text: "Signal Desktop stays in the background so this window is the messenger. Right-click the bar icon if you need the official app."
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+              Button {
+                text: "Got it"
+                foreground: root.foreground
+                accent: root.accent
+                onClicked: if (service) service.dismissBackgroundHint()
               }
             }
           }
@@ -722,13 +760,22 @@ Item {
           Text {
             width: parent.width
             text: service && service.desktop
-              ? (service.conversationCount + " chats. Photos, videos, and links load in the thread. Use + to attach.")
-              : "Open Signal Desktop once so Omarchy can read your local message database."
+              ? (service.conversationCount + " chats. Photos, videos, and links load in the thread. Use + to attach."
+                + (service.keepDesktopBackground ? " Signal Desktop is kept in the background for new messages." : ""))
+              : "Install and sign in to Signal Desktop once. After that this window can be the messenger — we'll keep Desktop hidden in the background."
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
             wrapMode: Text.WordWrap
             horizontalAlignment: Text.AlignHCenter
+          }
+          Button {
+            visible: service && service.desktopInstalled && !service.keepDesktopBackground
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: "Keep Signal in the background"
+            foreground: root.foreground
+            accent: root.accent
+            onClicked: if (service) service.setBackground(true)
           }
         }
 

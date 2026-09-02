@@ -16,6 +16,8 @@ Plugins run unsandboxed inside `omarchy-shell`. Read this repository before enab
 
 The plugin never writes Signal Desktop's database and never prints its key. It runs as the current user. Sending uses a linked extra signal-cli device, not as a replacement for Signal Desktop.
 
+By default the plugin **starts Signal Desktop hidden** (`--start-in-tray`) so you can use this window as the messenger. New messages still need Desktop's process; you do not need its window on a workspace. Toggle **BG on / BG off** in the sidebar, or right-click the bar icon to open the official app.
+
 ## Install
 
 ```sh

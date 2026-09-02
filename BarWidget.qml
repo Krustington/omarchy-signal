@@ -40,7 +40,8 @@ BarWidget {
   }
 
   function openDesktop() {
-    if (bar) bar.run("omarchy-launch-signal")
+    if (root.app && typeof root.app.showDesktop === "function") root.app.showDesktop()
+    else if (bar) bar.run("omarchy-launch-signal")
   }
 
   implicitWidth: button.implicitWidth

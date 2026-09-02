@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "krusty.signal",
   "name": "Signal",
-  "version": "2.5.0",
+  "version": "2.6.0",
   "author": "krusty",
   "license": "MIT",
   "description": "Signal messenger for Omarchy: every conversation from Signal Desktop, replies from the bar, themed to the desktop.",
