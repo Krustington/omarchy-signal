@@ -13,19 +13,26 @@ import hashlib
 import hmac
 import json
 import os
+import select
 import shutil
+import signal as posix
 import socket
+import stat
+import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 HOME = Path.home()
 STATE = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local" / "state")) / "omarchy" / "signal"
-VENV_PY = STATE / "venv" / "bin" / "python"
+VENV_DIR = STATE / "venv"
+VENV_PY = VENV_DIR / "bin" / "python"
 CLI_DIR = STATE / "signal-cli"
 CLI_BIN = CLI_DIR / "bin" / "signal-cli"
 CLI_VERSION = "0.14.7"
@@ -34,7 +41,8 @@ CLI_URL = (
     f"signal-cli-{CLI_VERSION}-Linux-native.tar.gz"
 )
 CLI_SHA256 = "0fe065294adcf35df4c249b635d0ce57de7765d4fec660bffaa2e7f0549d4e5f"
-SOCK = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "omarchy-signal" / "signal-cli.sock"
+CLI_ELF_SHA256 = "7dc5933215b6bedafab7ff0983466c0d0ae98bc20538f5186e7d1d600ccde63f"
+PY_PACKAGES = ("sqlcipher3-binary==0.6.0", "cryptography==50.0.1")
 QR_PATH = STATE / "link.png"
 SEEN_PATH = STATE / "seen.json"
 MEDIA_DIR = STATE / "media"
@@ -43,9 +51,12 @@ DB_PATH = DESKTOP_DIR / "sql" / "db.sqlite"
 CONFIG_PATH = DESKTOP_DIR / "config.json"
 ATTACH_ROOT = DESKTOP_DIR / "attachments.noindex"
 STDOUT_LIMIT = 2 * 1024 * 1024
-
-STATE.mkdir(parents=True, exist_ok=True)
-MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+MAX_CIPHERTEXT = 32 * 1024 * 1024
+MAX_PLAINTEXT = 24 * 1024 * 1024
+MAX_RPC = 256 * 1024
+MAX_DOWNLOAD = 180 * 1024 * 1024
+DOWNLOAD_SECONDS = 180
+OPEN_NOFOLLOW = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 MIME_EXT = {
     "image/jpeg": "jpg",
@@ -67,6 +78,143 @@ def file_url(path: Path) -> str:
     return "file://" + str(path)
 
 
+def _trusted_bin(name: str) -> Path:
+    raw = Path("/usr/bin") / name
+    resolved = raw.resolve()
+    if not str(resolved).startswith("/usr/") or not resolved.is_file():
+        raise RuntimeError(f"missing trusted binary {name}")
+    if not os.access(resolved, os.X_OK):
+        raise RuntimeError(f"not executable: {resolved}")
+    return resolved
+
+
+def _private_dir(path: Path) -> Path:
+    if path.exists() and path.is_symlink():
+        raise RuntimeError(f"{path} must not be a symlink")
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path, 0o700)
+    st = path.lstat()
+    if stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid() or (st.st_mode & 0o777) != 0o700:
+        raise RuntimeError(f"{path} is not a private directory")
+    return path
+
+
+def _runtime_dir() -> Path:
+    xdg = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    root = Path(xdg) / "omarchy-signal" if xdg else STATE / "run"
+    return _private_dir(root)
+
+
+def sock_path() -> Path:
+    return _runtime_dir() / "signal-cli.sock"
+
+
+def ident_path() -> Path:
+    return _runtime_dir() / "daemon.ident"
+
+
+def ensure_state_dirs() -> None:
+    _private_dir(STATE)
+    _private_dir(MEDIA_DIR)
+    _private_dir(CLI_DIR)
+    _private_dir(CLI_BIN.parent)
+
+
+def ensure_venv() -> Path:
+    ensure_state_dirs()
+    marker = VENV_DIR / ".deps"
+    want = "\n".join(PY_PACKAGES) + "\n"
+    if VENV_PY.is_file() and marker.is_file() and marker.read_text(encoding="utf-8") == want:
+        return VENV_PY
+    py = _trusted_bin("python3")
+    subprocess.run([str(py), "-m", "venv", str(VENV_DIR)], check=True, timeout=90)
+    subprocess.run(
+        [str(VENV_PY), "-m", "pip", "install", "--disable-pip-version-check", "--no-input", *PY_PACKAGES],
+        check=True,
+        timeout=180,
+    )
+    marker.write_text(want, encoding="utf-8")
+    os.chmod(marker, 0o600)
+    return VENV_PY
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _open_confined(root: Path, rel: str | None) -> int | None:
+    if not rel or not isinstance(rel, str):
+        return None
+    if rel.startswith("/") or "\\" in rel or "\x00" in rel:
+        return None
+    parts = [p for p in rel.split("/") if p]
+    if not parts or any(p in (".", "..") for p in parts):
+        return None
+    opened: list[int] = []
+    try:
+        fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        opened.append(fd)
+        for i, part in enumerate(parts):
+            flags = OPEN_NOFOLLOW
+            if i < len(parts) - 1:
+                flags |= os.O_DIRECTORY
+            fd = os.open(part, flags, dir_fd=opened[-1])
+            opened.append(fd)
+        leaf = opened.pop()
+        st = os.fstat(leaf)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_size > MAX_CIPHERTEXT:
+            os.close(leaf)
+            return None
+        return leaf
+    except OSError:
+        return None
+    finally:
+        for fd in opened:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _read_capped(fd: int, limit: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while total < limit:
+        buf = os.read(fd, min(1024 * 1024, limit - total))
+        if not buf:
+            break
+        chunks.append(buf)
+        total += len(buf)
+    extra = os.read(fd, 1)
+    if extra:
+        raise ValueError("file exceeds cap")
+    return b"".join(chunks)
+
+
+def _looks_like_media(data: bytes) -> bool:
+    if len(data) < 12:
+        return False
+    if data[:3] == b"\xff\xd8\xff":
+        return True
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return True
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return True
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return True
+    if data[4:8] == b"ftyp":
+        return True
+    if data[:4] == b"%PDF":
+        return True
+    if data[:3] == b"ID3" or data[:2] in (b"\xff\xfb", b"\xff\xf3"):
+        return True
+    return False
+
+
 def mime_kind(mime: str, attachment_type: str) -> str:
     if attachment_type == "preview":
         return "preview"
@@ -82,10 +230,9 @@ def mime_kind(mime: str, attachment_type: str) -> str:
     return "file"
 
 
-def decrypt_attachment(src: Path, local_key: str | None, size: int | None, version: int) -> bytes:
-    raw = src.read_bytes()
+def decrypt_attachment(raw: bytes, local_key: str | None, size: int | None, version: int) -> bytes:
     if int(version or 0) < 2 or not local_key:
-        return raw[: int(size or len(raw))]
+        return raw[: min(int(size or len(raw)), MAX_PLAINTEXT, len(raw))]
     keys = base64.b64decode(local_key)
     if len(keys) != 64:
         raise ValueError("invalid localKey")
@@ -101,28 +248,66 @@ def decrypt_attachment(src: Path, local_key: str | None, size: int | None, versi
 
     decryptor = Cipher(algorithms.AES(cipher_key), modes.CBC(iv)).decryptor()
     plain = decryptor.update(data) + decryptor.finalize()
-    limit = int(size or len(plain))
+    limit = min(int(size or len(plain)), MAX_PLAINTEXT, len(plain))
     return plain[:limit]
 
 
 def materialize_file(rel: str | None, local_key: str | None, size: int | None, version: int, mime: str, hint: str) -> str:
     if not rel:
         return ""
-    src = ATTACH_ROOT / str(rel).replace("\\", "/")
-    if not src.is_file():
-        return ""
     ext = MIME_EXT.get((mime or "").lower(), Path(hint or "").suffix.lstrip(".") or "bin")
+    if ext not in MIME_EXT.values() and ext not in ("bin", "jpg", "jpeg"):
+        ext = "bin"
     digest = hashlib.sha256(f"{rel}|{size}|{local_key or ''}".encode()).hexdigest()[:32]
     dest = MEDIA_DIR / f"{digest}.{ext}"
-    if dest.is_file() and dest.stat().st_size > 0:
-        return file_url(dest)
+    if dest.name != f"{digest}.{ext}":
+        return ""
     try:
-        data = decrypt_attachment(src, local_key, size, int(version or 0))
+        if dest.is_file() and not dest.is_symlink() and 0 < dest.stat().st_size <= MAX_PLAINTEXT:
+            return file_url(dest)
+    except OSError:
+        pass
+    fd = _open_confined(ATTACH_ROOT, str(rel))
+    if fd is None:
+        return ""
+    try:
+        raw = _read_capped(fd, MAX_CIPHERTEXT)
+        data = decrypt_attachment(raw, local_key, size, int(version or 0))
     except Exception:
         return ""
-    tmp = dest.with_suffix(dest.suffix + ".tmp")
-    tmp.write_bytes(data)
-    tmp.replace(dest)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    if not data or not _looks_like_media(data):
+        return ""
+    ensure_state_dirs()
+    return _finish_media(dest, data)
+
+
+def _finish_media(dest: Path, data: bytes) -> str:
+    media_fd = os.open(str(MEDIA_DIR), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    tmp_name = dest.name + ".tmp"
+    try:
+        try:
+            os.unlink(tmp_name, dir_fd=media_fd)
+        except OSError:
+            pass
+        tmp_fd = os.open(
+            tmp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=media_fd,
+        )
+        try:
+            os.write(tmp_fd, data)
+            os.fsync(tmp_fd)
+        finally:
+            os.close(tmp_fd)
+        os.replace(tmp_name, dest.name, src_dir_fd=media_fd, dst_dir_fd=media_fd)
+    finally:
+        os.close(media_fd)
     return file_url(dest)
 
 
@@ -547,16 +732,25 @@ def unread_total(conversations: list[dict]) -> int:
     return sum(int(item.get("unread") or 0) for item in conversations)
 
 
-def _is_cli_binary(path: Path) -> bool:
-    return path.is_file() and path.name == "signal-cli" and os.access(path, os.X_OK)
+def _cli_ok(path: Path) -> bool:
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    if path.name != "signal-cli" or stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return False
+    if not os.access(path, os.X_OK) or st.st_uid != os.getuid():
+        return False
+    try:
+        return _sha256_file(path) == CLI_ELF_SHA256
+    except OSError:
+        return False
 
 
 def which_cli() -> str | None:
-    for path in (CLI_BIN, CLI_DIR / "signal-cli"):
-        if _is_cli_binary(path):
-            return str(path)
-    found = shutil.which("signal-cli")
-    return found
+    if _cli_ok(CLI_BIN):
+        return str(CLI_BIN)
+    return None
 
 
 def linked_accounts() -> list[str]:
@@ -593,69 +787,243 @@ def linked_accounts() -> list[str]:
     return sorted(set(found))
 
 
+def _host_allowed(host: str) -> bool:
+    host = (host or "").lower().rstrip(".")
+    return host == "github.com" or host.endswith(".github.com") or host.endswith(".githubusercontent.com")
+
+
+class _BoundRedirect(urllib.request.HTTPRedirectHandler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.count = 0
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self.count += 1
+        if self.count > 4:
+            raise RuntimeError("too many redirects")
+        parsed = urllib.parse.urlparse(newurl)
+        if parsed.scheme != "https" or not _host_allowed(parsed.hostname or ""):
+            raise RuntimeError("redirect origin not allowed")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _download_https(url: str, dest: Path, max_bytes: int, timeout: int) -> None:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or not _host_allowed(parsed.hostname or ""):
+        raise RuntimeError("download origin not allowed")
+    opener = urllib.request.build_opener(_BoundRedirect(), urllib.request.HTTPSHandler())
+    req = urllib.request.Request(url, headers={"User-Agent": "krusty.signal"})
+    deadline = time.time() + timeout
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    try:
+        with opener.open(req, timeout=30) as resp:
+            final = urllib.parse.urlparse(resp.geturl())
+            if final.scheme != "https" or not _host_allowed(final.hostname or ""):
+                raise RuntimeError("final download origin not allowed")
+            written = 0
+            with tmp.open("wb") as out:
+                while True:
+                    if time.time() > deadline:
+                        raise RuntimeError("download timed out")
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > max_bytes:
+                        raise RuntimeError("download too large")
+                    out.write(chunk)
+        tmp.replace(dest)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def _find_extracted_cli(root: Path) -> Path | None:
-    files = [path for path in root.rglob("*") if path.is_file()]
-    for path in files:
-        if _is_cli_binary(path):
-            return path
-    for path in files:
-        if path.is_file() and os.access(path, os.X_OK) and "signal" in path.name:
+    for path in root.rglob("*"):
+        try:
+            st = path.lstat()
+        except OSError:
+            continue
+        if path.name == "signal-cli" and stat.S_ISREG(st.st_mode) and not stat.S_ISLNK(st.st_mode):
             return path
     return None
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def ensure_cli() -> dict:
     existing = which_cli()
     if existing:
         return {"installed": True, "path": existing, "downloaded": False}
-    CLI_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_state_dirs()
     archive = STATE / f"signal-cli-{CLI_VERSION}-Linux-native.tar.gz"
     if archive.exists() and _sha256_file(archive) != CLI_SHA256:
         archive.unlink()
-    if not archive.exists() or archive.stat().st_size < 1_000_000:
-        urllib.request.urlretrieve(CLI_URL, archive)
+    if not archive.exists():
+        _download_https(CLI_URL, archive, MAX_DOWNLOAD, DOWNLOAD_SECONDS)
     if _sha256_file(archive) != CLI_SHA256:
         try:
             archive.unlink()
         except OSError:
             pass
         raise RuntimeError("signal-cli download did not match the expected checksum")
-    staging = Path(tempfile.mkdtemp(prefix="signal-cli-extract-"))
+    staging = Path(tempfile.mkdtemp(prefix="omarchy-signal-cli-", dir=str(STATE)))
     try:
-        # Native builds ship a single `signal-cli` ELF at the archive root.
-        # JVM builds ship `signal-cli-VERSION/bin/signal-cli`. Never strip
-        # components: stripping a one-file native archive deletes the binary.
-        subprocess.run(
-            ["tar", "-xzf", str(archive), "-C", str(staging)],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        with tarfile.open(archive, "r:gz") as tar:
+            tar.extractall(staging, filter="data")
         found = _find_extracted_cli(staging)
-        if found is None:
-            names = [str(path.relative_to(staging)) for path in staging.rglob("*") if path.is_file()]
-            raise RuntimeError(
-                "signal-cli binary missing after download"
-                + (": " + ", ".join(names[:8]) if names else "")
-            )
-        CLI_BIN.parent.mkdir(parents=True, exist_ok=True)
+        if found is None or _sha256_file(found) != CLI_ELF_SHA256:
+            raise RuntimeError("signal-cli binary missing or checksum mismatch after extract")
         if CLI_BIN.exists():
             CLI_BIN.unlink()
-        shutil.move(str(found), str(CLI_BIN))
-        os.chmod(CLI_BIN, 0o755)
+        os.rename(found, CLI_BIN)
+        os.chmod(CLI_BIN, 0o700)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
-    if not _is_cli_binary(CLI_BIN):
+    if not which_cli():
         raise RuntimeError("signal-cli binary missing after download")
     return {"installed": True, "path": str(CLI_BIN), "downloaded": True}
+
+
+def _proc_starttime(pid: int) -> str:
+    raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+    rest = raw[raw.rfind(")") + 2 :].split()
+    return rest[19]
+
+
+def _proc_exe(pid: int) -> str:
+    return os.readlink(f"/proc/{pid}/exe")
+
+
+def _save_ident(proc: subprocess.Popen) -> None:
+    ident = {"pid": proc.pid, "starttime": _proc_starttime(proc.pid), "exe": _proc_exe(proc.pid)}
+    path = ident_path()
+    path.write_text(json.dumps(ident), encoding="utf-8")
+    os.chmod(path, 0o600)
+
+
+def _load_ident() -> dict | None:
+    try:
+        data = json.loads(ident_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _ident_matches(ident: dict) -> bool:
+    try:
+        pid = int(ident["pid"])
+        if _proc_starttime(pid) != str(ident.get("starttime")):
+            return False
+        exe = _proc_exe(pid)
+        return exe == str(ident.get("exe")) == str(CLI_BIN.resolve()) and _cli_ok(CLI_BIN)
+    except (OSError, KeyError, ValueError):
+        return False
+
+
+def _stop_pg(proc: subprocess.Popen | None) -> None:
+    if not proc or proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, posix.SIGTERM)
+    except OSError:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, posix.SIGKILL)
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _read_line_deadline(fd: int, deadline: float, cap: int = 4096) -> str:
+    buf = b""
+    while time.time() < deadline and len(buf) < cap:
+        remain = max(0.05, min(1.0, deadline - time.time()))
+        ready, _, _ = select.select([fd], [], [], remain)
+        if not ready:
+            continue
+        chunk = os.read(fd, 256)
+        if not chunk:
+            break
+        buf += chunk
+        if b"\n" in buf:
+            return buf.split(b"\n", 1)[0].decode("utf-8", "replace").strip()
+    return ""
+
+
+def _read_capped_fd(fd: int, cap: int, timeout: float) -> str:
+    buf = b""
+    deadline = time.time() + timeout
+    while time.time() < deadline and len(buf) < cap:
+        ready, _, _ = select.select([fd], [], [], max(0.05, deadline - time.time()))
+        if not ready:
+            break
+        chunk = os.read(fd, min(512, cap - len(buf)))
+        if not chunk:
+            break
+        buf += chunk
+    return buf.decode("utf-8", "replace")
+
+
+def _recv_capped(sock: socket.socket, cap: int) -> bytes:
+    buf = b""
+    while len(buf) < cap:
+        chunk = sock.recv(min(4096, cap - len(buf)))
+        if not chunk:
+            break
+        buf += chunk
+        if b"\n" in buf:
+            break
+    if len(buf) >= cap and b"\n" not in buf:
+        raise RuntimeError("response too large")
+    return buf
+
+
+def _peer_uid(sock: socket.socket) -> int:
+    creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+    _pid, uid, _gid = struct.unpack("3i", creds)
+    return uid
+
+
+def kill_our_daemon() -> None:
+    ident = _load_ident()
+    if not ident or not _ident_matches(ident):
+        return
+    pid = int(ident["pid"])
+    try:
+        os.killpg(pid, posix.SIGTERM)
+    except OSError:
+        try:
+            os.kill(pid, posix.SIGTERM)
+        except OSError:
+            return
+    deadline = time.time() + 3
+    while time.time() < deadline and Path(f"/proc/{pid}").exists():
+        time.sleep(0.1)
+    if Path(f"/proc/{pid}").exists():
+        try:
+            os.killpg(pid, posix.SIGKILL)
+        except OSError:
+            try:
+                os.kill(pid, posix.SIGKILL)
+            except OSError:
+                pass
+    try:
+        ident_path().unlink()
+    except OSError:
+        pass
 
 
 class Linker:
@@ -668,38 +1036,32 @@ class Linker:
     def start(self, device_name: str = "Omarchy") -> dict:
         self.stop()
         cli = which_cli() or ensure_cli()["path"]
+        if not _cli_ok(Path(cli)):
+            raise RuntimeError("signal-cli identity check failed")
         self.proc = subprocess.Popen(
             [cli, "link", "-n", device_name],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            start_new_session=True,
         )
-        uri = ""
         assert self.proc.stdout is not None
         deadline = time.time() + 15
-        while time.time() < deadline:
-            line = self.proc.stdout.readline()
-            if not line:
-                break
-            line = line.strip()
-            if line.startswith("sgnl://") or line.startswith("https://signal.org"):
-                uri = line
-                break
-        if not uri:
+        uri = _read_line_deadline(self.proc.stdout.fileno(), deadline)
+        if not (uri.startswith("sgnl://") or uri.startswith("https://signal.org")):
             err = ""
             if self.proc.stderr:
-                try:
-                    err = self.proc.stderr.read()
-                except Exception:
-                    err = ""
+                err = _read_capped_fd(self.proc.stderr.fileno(), 8192, 1.0)
             self.error = err.strip() or "signal-cli did not return a link URI"
+            self.stop()
             return {"ok": False, "error": self.error}
         self.uri = uri
-        QR_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ensure_state_dirs()
+        qr = _trusted_bin("qrencode")
         subprocess.run(
-            ["qrencode", "-o", str(QR_PATH), "-s", "8", "-m", "2", uri],
+            [str(qr), "-o", str(QR_PATH), "-s", "8", "-m", "2", uri],
             check=True,
             capture_output=True,
+            timeout=5,
         )
         threading.Thread(target=self._wait, daemon=True).start()
         return {"ok": True, "uri": uri, "qr": str(QR_PATH)}
@@ -707,15 +1069,18 @@ class Linker:
     def _wait(self) -> None:
         if not self.proc:
             return
-        code = self.proc.wait()
+        try:
+            code = self.proc.wait(timeout=300)
+        except subprocess.TimeoutExpired:
+            self.stop()
+            self.error = "link timed out"
+            self.done = True
+            return
         self.done = True
         if code != 0 and not linked_accounts():
             err = ""
-            if self.proc.stderr:
-                try:
-                    err = self.proc.stderr.read()
-                except Exception:
-                    err = ""
+            if self.proc and self.proc.stderr:
+                err = _read_capped_fd(self.proc.stderr.fileno(), 8192, 0.5)
             self.error = err.strip() or f"link exited {code}"
 
     def status(self) -> dict:
@@ -731,80 +1096,22 @@ class Linker:
         }
 
     def stop(self) -> None:
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
+        _stop_pg(self.proc)
         self.proc = None
 
 
-def _cli_pids(keep_pid: int | None = None, daemons_only: bool = True) -> list[int]:
-    target = str(CLI_BIN.resolve()) if CLI_BIN.exists() else ""
-    found: list[int] = []
-    for pid_dir in Path("/proc").iterdir():
-        if not pid_dir.name.isdigit():
-            continue
-        pid = int(pid_dir.name)
-        if keep_pid is not None and pid == keep_pid:
-            continue
-        try:
-            raw = (pid_dir / "cmdline").read_bytes().split(b"\x00")
-        except OSError:
-            continue
-        argv0 = raw[0].decode("utf-8", "replace") if raw else ""
-        if argv0 != target and not argv0.endswith("/signal-cli"):
-            continue
-        joined = b" ".join(raw)
-        if daemons_only and b"daemon" not in joined:
-            continue
-        found.append(pid)
-    return found
-
-
-def kill_stale_cli(keep_pid: int | None = None) -> int:
-    pids = _cli_pids(keep_pid=keep_pid, daemons_only=True)
-    killed = 0
-    for pid in pids:
-        try:
-            os.kill(pid, 15)
-            killed += 1
-        except OSError:
-            pass
-    deadline = time.time() + 3.0
-    while time.time() < deadline:
-        alive = [pid for pid in pids if Path(f"/proc/{pid}").exists()]
-        if not alive:
-            break
-        time.sleep(0.1)
-    for pid in pids:
-        if Path(f"/proc/{pid}").exists():
-            try:
-                os.kill(pid, 9)
-            except OSError:
-                pass
-    if killed:
-        time.sleep(0.3)
-    return killed
-
-
 def socket_alive() -> bool:
-    if not SOCK.exists():
+    path = sock_path()
+    if not path.exists() or path.is_symlink():
         return False
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         sock.settimeout(1.5)
-        sock.connect(str(SOCK))
+        sock.connect(str(path))
+        if _peer_uid(sock) != os.getuid():
+            return False
         sock.sendall(b'{"jsonrpc":"2.0","method":"version","id":"ping"}\n')
-        buf = b""
-        while True:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            buf += chunk
-            if b"\n" in buf:
-                break
+        buf = _recv_capped(sock, MAX_RPC)
         return b"jsonrpc" in buf or b"result" in buf
     except OSError:
         return False
@@ -826,34 +1133,38 @@ class CliDaemon:
         if not accounts:
             return {"ok": False, "error": "No linked Signal account"}
         self.account = accounts[0]
+        sock = sock_path()
         if socket_alive():
-            return {"ok": True, "account": self.account, "socket": str(SOCK), "reused": True}
+            ident = _load_ident()
+            if ident and _ident_matches(ident):
+                return {"ok": True, "account": self.account, "socket": str(sock), "reused": True}
         with self._lock:
             if socket_alive():
-                return {"ok": True, "account": self.account, "socket": str(SOCK), "reused": True}
+                ident = _load_ident()
+                if ident and _ident_matches(ident):
+                    return {"ok": True, "account": self.account, "socket": str(sock), "reused": True}
             cli = which_cli()
             if not cli:
                 return {"ok": False, "error": "signal-cli is not installed"}
-            kill_stale_cli(keep_pid=self.proc.pid if self.proc else None)
-            SOCK.parent.mkdir(parents=True, exist_ok=True)
-            if SOCK.exists() and not socket_alive():
+            kill_our_daemon()
+            if sock.exists():
                 try:
-                    SOCK.unlink()
+                    sock.unlink()
                 except OSError:
                     pass
-            log = SOCK.parent / "daemon.log"
-            log_f = open(log, "a")
-            log_f.write(f"\n--- start {time.strftime('%Y-%m-%d %H:%M:%S')} account={self.account} ---\n")
-            log_f.flush()
+            log = _runtime_dir() / "daemon.log"
+            log_f = open(log, "ab", buffering=0)
             self.proc = subprocess.Popen(
-                [cli, "-a", self.account, "daemon", f"--socket={SOCK}", "--no-receive-stdout"],
+                [cli, "-a", self.account, "daemon", f"--socket={sock}", "--no-receive-stdout"],
                 stdout=log_f,
                 stderr=log_f,
                 start_new_session=True,
             )
-            for _ in range(120):
+            _save_ident(self.proc)
+            deadline = time.time() + 30
+            while time.time() < deadline:
                 if socket_alive():
-                    return {"ok": True, "account": self.account, "socket": str(SOCK)}
+                    return {"ok": True, "account": self.account, "socket": str(sock)}
                 if self.proc.poll() is not None:
                     err = ""
                     try:
@@ -862,12 +1173,11 @@ class CliDaemon:
                         err = f"exited {self.proc.returncode}"
                     return {"ok": False, "error": err.strip() or "signal-cli daemon exited"}
                 time.sleep(0.25)
-            if socket_alive():
-                return {"ok": True, "account": self.account, "socket": str(SOCK)}
             return {"ok": False, "error": "signal-cli daemon did not create a socket"}
 
     def alive(self) -> bool:
-        return socket_alive()
+        ident = _load_ident()
+        return socket_alive() and bool(ident and _ident_matches(ident))
 
     def rpc(self, method: str, params: dict | None = None) -> dict:
         if not self.alive():
@@ -875,25 +1185,19 @@ class CliDaemon:
             if not started.get("ok"):
                 raise RuntimeError(started.get("error") or "daemon unavailable")
         payload = {"jsonrpc": "2.0", "method": method, "id": str(time.time()), "params": params or {}}
+        path = sock_path()
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             sock.settimeout(20)
-            sock.connect(str(SOCK))
+            sock.connect(str(path))
+            if _peer_uid(sock) != os.getuid():
+                raise RuntimeError("socket peer uid mismatch")
             sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
-            chunks = []
-            while True:
-                data = sock.recv(65536)
-                if not data:
-                    break
-                chunks.append(data)
-                if b"\n" in data:
-                    break
+            raw = _recv_capped(sock, MAX_RPC).decode("utf-8", "replace").strip()
         finally:
             sock.close()
-        raw = b"".join(chunks).decode("utf-8", "replace").strip()
         if not raw:
             raise RuntimeError("empty response from signal-cli")
-        # daemon may emit notifications before the result; take the last JSON object with our id or result/error
         parsed = None
         for line in raw.splitlines():
             try:
@@ -910,13 +1214,28 @@ class CliDaemon:
         return parsed.get("result")
 
 
+def _owned_regular_file(path: str) -> str | None:
+    if not path.startswith("/") or ".." in path.split("/"):
+        return None
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return None
+    if st.st_uid != os.getuid() or st.st_size > MAX_CIPHERTEXT:
+        return None
+    return path
+
+
 def send_message(db: DesktopDB, daemon: CliDaemon, conversation_id: str, text: str, attachments=None) -> dict:
     body = str(text or "").strip()
     files = []
     for item in attachments or []:
         path = str(item or "").replace("file://", "")
-        if path.startswith("/") and os.path.isfile(path):
-            files.append(path)
+        owned = _owned_regular_file(path)
+        if owned:
+            files.append(owned)
     if not body and not files:
         raise RuntimeError("Message is empty")
     rows = db.query(
@@ -1069,6 +1388,10 @@ def serve() -> None:
 
 
 def main() -> None:
+    ensure_venv()
+    here = str(Path(__file__).resolve())
+    if Path(sys.executable).resolve() != VENV_PY.resolve():
+        os.execv(str(VENV_PY), [str(VENV_PY), here, *sys.argv[1:]])
     cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
     if cmd == "serve":
         serve()

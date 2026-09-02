@@ -16,8 +16,7 @@ Item {
 
   readonly property string pluginId: manifest && manifest.id ? String(manifest.id) : "krusty.signal"
   readonly property string pluginDir: manifest && manifest.__sourceDir ? String(manifest.__sourceDir) : Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "")
-  readonly property string home: Quickshell.env("HOME")
-  readonly property string venvPython: home + "/.local/state/omarchy/signal/venv/bin/python"
+  readonly property string systemPython: "/usr/bin/python3"
   readonly property string enginePath: Qt.resolvedUrl("engine.py").toString().replace(/^file:\/\//, "")
 
   property bool windowOpen: false
@@ -280,7 +279,7 @@ Item {
     id: engine
     running: true
     stdinEnabled: true
-    command: [root.venvPython, root.enginePath, "serve"]
+    command: [root.systemPython, root.enginePath, "serve"]
     stdout: SplitParser {
       splitMarker: "\n"
       onRead: function(line) { root.handleLine(line) }

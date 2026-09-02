@@ -10,11 +10,11 @@ Plugins run unsandboxed inside `omarchy-shell`. Read this repository before enab
 
 - Omarchy Quattro
 - [Signal Desktop](https://signal.org/download/) signed in on this computer (history is read from its local database)
-- Python 3 with a user venv (`sqlcipher3-binary`, `cryptography`) created automatically under `~/.local/state/omarchy/signal/venv`
-- `qrencode` and `zenity` for the device-link QR code and file picker
-- A one-time download of [signal-cli](https://github.com/AsamK/signal-cli) **v0.14.7** Linux-native (~110 MB), verified against a pinned SHA-256 before it is extracted
+- `/usr/bin/python3` (the engine creates `~/.local/state/omarchy/signal/venv` on first start and installs pinned `sqlcipher3-binary==0.6.0` and `cryptography==50.0.1`)
+- `/usr/bin/qrencode` and `zenity` for the device-link QR code and file picker
+- A one-time download of [signal-cli](https://github.com/AsamK/signal-cli) **v0.14.7** Linux-native (~110 MB). The archive and extracted binary are checked against pinned SHA-256 digests before use.
 
-The plugin never writes Signal Desktop's database and never prints its key. It does not use `sudo`. Sending uses signal-cli as an extra linked device, not as a replacement for Signal Desktop.
+The plugin never writes Signal Desktop's database and never prints its key. It runs as the current user. Sending uses a linked extra signal-cli device, not as a replacement for Signal Desktop.
 
 ## Install
 
